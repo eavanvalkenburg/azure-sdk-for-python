@@ -5,17 +5,16 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from agent_framework import (
-    AgentRunResponseUpdate,
-    AgentRunUpdateEvent,
-    BaseChatClient,
-    ChatMessage,
-    Contents,
+    AgentResponseUpdate,
+    Content,
     Executor,
-    Role as ChatRole,
+    Message,
+    WorkflowEvent,
     WorkflowBuilder,
     WorkflowContext,
     handler,
 )
+from agent_framework.azure import SupportsChatGetResponse
 from agent_framework_azure_ai import AzureAIAgentClient
 from azure.identity.aio import DefaultAzureCredential
 from dotenv import load_dotenv
@@ -42,7 +41,7 @@ The example implements a quality-controlled AI assistant where:
 Key concepts demonstrated:
 - WorkflowAgent: Wraps a workflow to make it behave as an agent
 - Bidirectional workflow with cycles (Worker ↔ Reviewer)
-- AgentRunUpdateEvent: How workflows communicate with external consumers
+- WorkflowEvent: How workflows communicate with external consumers
 - Structured output parsing for review feedback
 - State management with pending requests tracking
 """
@@ -51,8 +50,8 @@ Key concepts demonstrated:
 @dataclass
 class ReviewRequest:
     request_id: str
-    user_messages: list[ChatMessage]
-    agent_messages: list[ChatMessage]
+    user_messages: list[Message]
+    agent_messages: list[Message]
 
 
 @dataclass
@@ -68,7 +67,7 @@ load_dotenv()
 class Reviewer(Executor):
     """An executor that reviews messages and provides feedback."""
 
-    def __init__(self, chat_client: BaseChatClient) -> None:
+    def __init__(self, chat_client: SupportsChatGetResponse) -> None:
         super().__init__(id="reviewer")
         self._chat_client = chat_client
 
@@ -89,18 +88,20 @@ class Reviewer(Executor):
 
         # Define the system prompt.
         messages = [
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                text="You are a reviewer for an AI agent, please provide feedback on the "
-                "following exchange between a user and the AI agent, "
-                "and indicate if the agent's responses are approved or not.\n"
-                "Use the following criteria for your evaluation:\n"
-                "- Relevance: Does the response address the user's query?\n"
-                "- Accuracy: Is the information provided correct?\n"
-                "- Clarity: Is the response easy to understand?\n"
-                "- Completeness: Does the response cover all aspects of the query?\n"
-                "Be critical in your evaluation and provide constructive feedback.\n"
-                "Do not approve until all criteria are met.",
+            Message(
+                role="system",
+                contents=[Content.from_text(
+                    "You are a reviewer for an AI agent, please provide feedback on the "
+                    "following exchange between a user and the AI agent, "
+                    "and indicate if the agent's responses are approved or not.\n"
+                    "Use the following criteria for your evaluation:\n"
+                    "- Relevance: Does the response address the user's query?\n"
+                    "- Accuracy: Is the information provided correct?\n"
+                    "- Clarity: Is the response easy to understand?\n"
+                    "- Completeness: Does the response cover all aspects of the query?\n"
+                    "Be critical in your evaluation and provide constructive feedback.\n"
+                    "Do not approve until all criteria are met."
+                )],
             )
         ]
 
@@ -112,16 +113,16 @@ class Reviewer(Executor):
 
         # Add add one more instruction for the assistant to follow.
         messages.append(
-            ChatMessage(
-                role=ChatRole.USER,
-                text="Please provide a review of the agent's responses to the user.",
+            Message(
+                role="user",
+                contents=[Content.from_text("Please provide a review of the agent's responses to the user.")],
             )
         )
 
         print("🔍 Reviewer: Sending review request to LLM...")
         # Get the response from the chat client.
         response = await self._chat_client.get_response(
-            messages=messages, response_format=_Response
+            messages=messages, options={"response_format": _Response}
         )
 
         # Parse the response.
@@ -143,21 +144,21 @@ class Reviewer(Executor):
 class Worker(Executor):
     """An executor that performs tasks for the user."""
 
-    def __init__(self, chat_client: BaseChatClient) -> None:
+    def __init__(self, chat_client: SupportsChatGetResponse) -> None:
         super().__init__(id="worker")
         self._chat_client = chat_client
-        self._pending_requests: dict[str, tuple[ReviewRequest, list[ChatMessage]]] = {}
+        self._pending_requests: dict[str, tuple[ReviewRequest, list[Message]]] = {}
 
     @handler
     async def handle_user_messages(
-        self, user_messages: list[ChatMessage], ctx: WorkflowContext[ReviewRequest]
+        self, user_messages: list[Message], ctx: WorkflowContext[ReviewRequest]
     ) -> None:
         print("🔧 Worker: Received user messages, generating response...")
 
         # Handle user messages and prepare a review request for the reviewer.
         # Define the system prompt.
         messages = [
-            ChatMessage(role=ChatRole.SYSTEM, text="You are a helpful assistant.")
+            Message(role="system", contents=[Content.from_text("You are a helpful assistant.")])
         ]
 
         # Add user messages.
@@ -196,7 +197,7 @@ class Worker(Executor):
         )
 
         # Handle the review response. Depending on the approval status,
-        # either emit the approved response as AgentRunUpdateEvent, or
+        # either emit the approved response as a WorkflowEvent, or
         # retry given the feedback.
         if review.request_id not in self._pending_requests:
             raise ValueError(
@@ -207,19 +208,19 @@ class Worker(Executor):
 
         if review.approved:
             print("✅ Worker: Response approved! Emitting to external consumer...")
-            # If approved, emit the agent run response update to the workflow's
+            # If approved, emit the agent response update to the workflow's
             # external consumer.
-            contents: list[Contents] = []
+            contents: list[Content] = []
             for message in request.agent_messages:
                 contents.extend(message.contents)
-            # Emitting an AgentRunUpdateEvent in a workflow wrapped by a WorkflowAgent
-            # will send the AgentRunResponseUpdate to the WorkflowAgent's
+            # Emitting a WorkflowEvent in a workflow wrapped by a WorkflowAgent
+            # will send the AgentResponseUpdate to the WorkflowAgent's
             # event stream.
             await ctx.add_event(
-                AgentRunUpdateEvent(
+                WorkflowEvent(
                     self.id,
-                    data=AgentRunResponseUpdate(
-                        contents=contents, role=ChatRole.ASSISTANT
+                    data=AgentResponseUpdate(
+                        contents=contents, role="assistant"
                     ),
                 )
             )
@@ -229,13 +230,15 @@ class Worker(Executor):
         print("🔧 Worker: Incorporating feedback and regenerating response...")
 
         # Construct new messages with feedback.
-        messages.append(ChatMessage(role=ChatRole.SYSTEM, text=review.feedback))
+        messages.append(Message(role="system", contents=[Content.from_text(review.feedback)]))
 
         # Add additional instruction to address the feedback.
         messages.append(
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                text="Please incorporate the feedback above, and provide a response to user's next message.",
+            Message(
+                role="system",
+                contents=[Content.from_text(
+                    "Please incorporate the feedback above, and provide a response to user's next message."
+                )],
             )
         )
         messages.extend(request.user_messages)
@@ -264,18 +267,17 @@ class Worker(Executor):
         self._pending_requests[new_request.request_id] = (new_request, messages)
 
 
-def build_agent(chat_client: BaseChatClient):
+def build_agent(chat_client: SupportsChatGetResponse):
     reviewer = Reviewer(chat_client=chat_client)
     worker = Worker(chat_client=chat_client)
     return (
-        WorkflowBuilder()
+        WorkflowBuilder(start_executor=worker)
         .add_edge(
             worker, reviewer
         )  # <--- This edge allows the worker to send requests to the reviewer
         .add_edge(
             reviewer, worker
         )  # <--- This edge allows the reviewer to send feedback back to the worker
-        .set_start_executor(worker)
         .build()
         .as_agent()  # Convert the workflow to an agent.
     )

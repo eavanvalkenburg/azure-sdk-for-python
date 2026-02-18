@@ -10,12 +10,7 @@ import json
 import uuid
 from typing import Any, List, Optional, cast
 
-from agent_framework import AgentRunResponseUpdate, FunctionApprovalRequestContent, FunctionResultContent
-from agent_framework._types import (
-    ErrorContent,
-    FunctionCallContent,
-    TextContent,
-)
+from agent_framework import AgentResponseUpdate, Content
 
 from azure.ai.agentserver.core import AgentRunContext
 from azure.ai.agentserver.core.logger import get_logger
@@ -42,7 +37,7 @@ from azure.ai.agentserver.core.models.projects import (
     ResponseTextDoneEvent,
 )
 
-from .agent_id_generator import AgentIdGenerator
+from .agent_id_generator import generate_agent_id
 
 logger = get_logger()
 
@@ -108,12 +103,13 @@ class _TextContentStreamingState(_BaseStreamingState):
             self.text_part_started = True
         return events
 
-    def convert_content(self, ctx: Any, content: TextContent) -> List[ResponseStreamEvent]:
+    def convert_content(self, ctx: Any, content: Content) -> List[ResponseStreamEvent]:
         events: List[ResponseStreamEvent] = []
-        if isinstance(content, TextContent):
-            delta = content.text or ""
-        else:
-            delta = getattr(content, "text", None) or getattr(content, "reasoning", "") or ""
+        match content.type:
+            case "text":
+                delta = content.text or ""
+            case _:
+                delta = getattr(content, "text", None) or getattr(content, "reasoning", "") or ""
 
         # buffer accumulated text
         self.text_buffer += delta
@@ -233,7 +229,7 @@ class _FunctionCallStreamingState(_BaseStreamingState):
         )
         return events
 
-    def convert_content(self, ctx: Any, content: FunctionCallContent) -> List[ResponseStreamEvent]:
+    def convert_content(self, ctx: Any, content: Content) -> List[ResponseStreamEvent]:
         events: List[ResponseStreamEvent] = []
         # record identifiers (once available)
         self.name = getattr(content, "name", None) or self.name or ""
@@ -368,38 +364,30 @@ class _FunctionCallOutputStreamingState(_BaseStreamingState):
     def convert_content(self, ctx: Any, content: Any) -> List[ResponseStreamEvent]:  # no delta events for now
         events: List[ResponseStreamEvent] = []
         # treat entire output as final
-        result = []
         raw = getattr(content, "result", None)
-        if isinstance(raw, str):
-            result = [raw or self.output]
-        elif isinstance(raw, list):
-            for item in raw:
-                result.append(self._coerce_result_text(item))
+        match raw:
+            case str():
+                result = [raw or self.output]
+            case list():
+                result = [self._coerce_result_text(item) for item in raw]
+            case _:
+                result = []
         self.output = json.dumps(result) if len(result) > 0 else ""
 
         events.extend(self.afterwork(ctx))
         return events
 
     def _coerce_result_text(self, value: Any) -> str | dict:
-        """
-        Return a string if value is already str or a TextContent-like object; else str(value).
-
-        :param value: The value to coerce.
-        :type value: Any
-
-        :return: The coerced string or dict.
-        :rtype: str | dict
-        """
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        # Direct TextContent instance
-        if isinstance(value, TextContent):
-            content_payload = {"type": "text", "text": getattr(value, "text", "")}
-            return content_payload
-
-        return ""
+        """Return a string or dict representation of a result value."""
+        match value:
+            case None:
+                return ""
+            case str():
+                return value
+            case _ if hasattr(value, 'type') and value.type == "text":
+                return {"type": "text", "text": getattr(value, "text", "")}
+            case _:
+                return ""
 
     def afterwork(self, ctx: Any) -> List[ResponseStreamEvent]:
         events: List[ResponseStreamEvent] = []
@@ -470,20 +458,21 @@ class AgentFrameworkOutputStreamingConverter:
             self._active_kind = None
 
         if self._active_state is None:
-            if kind == "text":
-                self._active_state = _TextContentStreamingState(self._context)
-            elif kind == "function_call":
-                self._active_state = _FunctionCallStreamingState(self._context)
-            elif kind == "function_call_output":
-                self._active_state = _FunctionCallOutputStreamingState(self._context)
-            else:
-                self._active_state = None
+            match kind:
+                case "text":
+                    self._active_state = _TextContentStreamingState(self._context)
+                case "function_call":
+                    self._active_state = _FunctionCallStreamingState(self._context)
+                case "function_call_output":
+                    self._active_state = _FunctionCallOutputStreamingState(self._context)
+                case _:
+                    self._active_state = None
             self._active_kind = kind
             if self._active_state:
                 events.extend(self._active_state.prework(self))
         return events
 
-    def transform_output_for_streaming(self, update: AgentRunResponseUpdate) -> List[ResponseStreamEvent]:
+    def transform_output_for_streaming(self, update: AgentResponseUpdate) -> List[ResponseStreamEvent]:
         logger.debug(
             "Transforming streaming update with %d contents",
             len(update.contents) if getattr(update, "contents", None) else 0,
@@ -493,39 +482,44 @@ class AgentFrameworkOutputStreamingConverter:
 
         if getattr(update, "contents", None):
             for i, content in enumerate(update.contents):
-                logger.debug("Processing content %d: %s", i, type(content))
-                if isinstance(content, TextContent):
-                    events.extend(self._switch_state("text"))
-                    if isinstance(self._active_state, _TextContentStreamingState):
-                        events.extend(self._active_state.convert_content(self, content))
-                elif isinstance(content, FunctionCallContent):
-                    events.extend(self._switch_state("function_call"))
-                    if isinstance(self._active_state, _FunctionCallStreamingState):
-                        events.extend(self._active_state.convert_content(self, content))
-                elif isinstance(content, FunctionResultContent):
-                    events.extend(self._switch_state("function_call_output"))
-                    if isinstance(self._active_state, _FunctionCallOutputStreamingState):
-                        call_id = getattr(content, "call_id", None)
-                        if call_id:
-                            self._active_state.call_id = call_id
-                        events.extend(self._active_state.convert_content(self, content))
-                elif isinstance(content, FunctionApprovalRequestContent):
-                    events.extend(self._switch_state("function_call"))
-                    if isinstance(self._active_state, _FunctionCallStreamingState):
-                        self._active_state.requires_approval = True
-                        self._active_state.approval_request_id = getattr(content, "id", None)
-                        events.extend(self._active_state.convert_content(self, content.function_call))
-                elif isinstance(content, ErrorContent):
-                    # errors are stateless; flush current state and emit error
-                    events.extend(self._switch_state("error"))
-                    events.append(
-                        ResponseErrorEvent(
-                            sequence_number=self.next_sequence(),
-                            code=getattr(content, "error_code", None) or "server_error",
-                            message=getattr(content, "message", None) or "An error occurred",
-                            param="",
+                logger.debug("Processing content %d: %s", i, content.type)
+                match content.type:
+                    case "text" | "text_reasoning":
+                        events.extend(self._switch_state("text"))
+                        if isinstance(self._active_state, _TextContentStreamingState):
+                            events.extend(self._active_state.convert_content(self, content))
+                    case "function_call":
+                        events.extend(self._switch_state("function_call"))
+                        if isinstance(self._active_state, _FunctionCallStreamingState):
+                            events.extend(self._active_state.convert_content(self, content))
+                    case "function_result":
+                        events.extend(self._switch_state("function_call_output"))
+                        if isinstance(self._active_state, _FunctionCallOutputStreamingState):
+                            call_id = getattr(content, "call_id", None)
+                            if call_id:
+                                self._active_state.call_id = call_id
+                            events.extend(self._active_state.convert_content(self, content))
+                    case "function_approval_request":
+                        events.extend(self._switch_state("function_call"))
+                        if isinstance(self._active_state, _FunctionCallStreamingState):
+                            self._active_state.requires_approval = True
+                            self._active_state.approval_request_id = getattr(content, "id", None)
+                            events.extend(self._active_state.convert_content(self, content.function_call))
+                    case "error":
+                        events.extend(self._switch_state("error"))
+                        events.append(
+                            ResponseErrorEvent(
+                                sequence_number=self.next_sequence(),
+                                code=getattr(content, "error_code", None) or "server_error",
+                                message=getattr(content, "message", None) or "An error occurred",
+                                param="",
+                            )
                         )
-                    )
+                    case "usage":
+                        # Usage metadata — not emitted as a stream event
+                        logger.debug("Skipping usage content (input/output token counts)")
+                    case _:
+                        logger.warning("Unhandled content type in streaming: %s", content.type)
         return events
 
     def finalize_last_content(self) -> List[ResponseStreamEvent]:
@@ -538,7 +532,7 @@ class AgentFrameworkOutputStreamingConverter:
 
     def build_response(self, status: str) -> OpenAIResponse:
         self._ensure_response_started()
-        agent_id = AgentIdGenerator.generate(self._context)
+        agent_id = generate_agent_id(self._context)
         response_data = {
             "object": "response",
             "agent_id": agent_id,

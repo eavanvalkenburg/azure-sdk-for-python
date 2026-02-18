@@ -23,7 +23,7 @@ async def main() -> None:
             "GITHUB_TOKEN environment variable not set. Provide a GitHub token with MCP access."
         )
 
-    agent = AzureOpenAIChatClient(credential=DefaultAzureCredential()).create_agent(
+    agent = AzureOpenAIChatClient(credential=DefaultAzureCredential()).as_agent(
         instructions="You are a helpful assistant that answers GitHub questions. Use only the exposed MCP tools.",
         tools=MCPStreamableHTTPTool(
             name=MCP_TOOL_NAME,
